@@ -78,10 +78,16 @@ export async function executeCommand(
   options?: { cwd?: string; env?: Record<string, string> },
 ): Promise<Result<string>> {
   try {
+    // Inherit current environment and merge with provided env
+    const currentEnv = Deno.env.toObject();
+    const env = options?.env
+      ? { ...currentEnv, ...options.env }
+      : undefined;
+
     const cmd = new Deno.Command(command, {
       args,
       cwd: options?.cwd,
-      env: options?.env,
+      env,
       stdout: "piped",
       stderr: "piped",
     });
