@@ -1,5 +1,5 @@
 {
-  "name": "puvlish",
+  "name": "@tirio/puvlish",
   "version": "0.1.0",
   "exports": "./src/cli.ts",
   "tasks": {

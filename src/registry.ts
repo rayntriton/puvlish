@@ -202,13 +202,63 @@ export async function publishToJsr(
 ): Promise<Result<void>> {
   logger?.info("Publishing to JSR...");
 
-  // Run deno publish
-  const result = await executeCommand("deno", ["publish"], { cwd: path });
+  // Run deno publish with --allow-dirty flag in case of uncommitted changes
+  const result = await executeCommand(
+    "deno",
+    ["publish", "--allow-dirty"],
+    { cwd: path },
+  );
 
   if (!result.ok) {
+    const errorMessage = result.error.message;
+
+    // Provide helpful error messages based on the error
+    if (errorMessage.includes("authentication") || errorMessage.includes("token")) {
+      logger?.error("JSR authentication failed");
+      logger?.info("Make sure JSR_TOKEN environment variable is set");
+      logger?.info("Get a token at: https://jsr.io/account/tokens");
+
+      return Err(
+        new PublishError(
+          "JSR authentication failed. Set JSR_TOKEN environment variable.",
+          "JSR_AUTH_FAILED",
+          result.error,
+        ),
+      );
+    }
+
+    if (errorMessage.includes("name") || errorMessage.includes("scope")) {
+      logger?.error("Invalid package name in deno.json");
+      logger?.info("Package name must be in format: @scope/package-name");
+
+      return Err(
+        new PublishError(
+          "Invalid JSR package name. Check deno.json",
+          "JSR_INVALID_NAME",
+          result.error,
+        ),
+      );
+    }
+
+    if (errorMessage.includes("version")) {
+      logger?.error("Invalid or duplicate version");
+      logger?.info("Version must be valid semver and not already published");
+
+      return Err(
+        new PublishError(
+          "Invalid or duplicate version. Update version in deno.json",
+          "JSR_INVALID_VERSION",
+          result.error,
+        ),
+      );
+    }
+
+    // Generic error with full message
+    logger?.error(`JSR publish failed: ${errorMessage}`);
+
     return Err(
       new PublishError(
-        "Failed to publish to JSR",
+        `Failed to publish to JSR: ${errorMessage}`,
         "JSR_PUBLISH_FAILED",
         result.error,
       ),

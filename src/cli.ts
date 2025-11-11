@@ -212,6 +212,120 @@ async function main() {
       console.log("\n✅ Setup check complete\n");
     });
 
+  // Add init command for guided setup
+  command
+    .command("init")
+    .description("Initialize project for publishing (guided setup)")
+    .option("-v, --verbose", "Enable verbose logging", { default: false })
+    .action(async (options) => {
+      const logger = new Logger(options.verbose);
+
+      console.log(`\n🚀 publishjs init v${VERSION}\n`);
+      logger.info("This wizard will help you set up your project for publishing.\n");
+
+      const { autoInitializeGit, needsGitInit } = await import("./auto_init.ts");
+      const { autoCreateRemote, needsRemoteSetup } = await import("./auto_remote.ts");
+      const { validateJsrConfig, autoFixJsrConfig } = await import("./jsr_validator.ts");
+      const { displayJsrTokenStatus } = await import("./jsr_auth.ts");
+      const { isGitInstalled } = await import("./git.ts");
+
+      const path = Deno.cwd();
+
+      // Step 1: Check Git installation
+      logger.section("Step 1: Git Setup");
+      const gitInstalled = await isGitInstalled();
+
+      if (!gitInstalled) {
+        logger.error("Git is not installed");
+        logger.info("Please install Git from: https://git-scm.com/downloads");
+        logger.info("Run 'publishjs init' again after installing Git");
+        Deno.exit(1);
+      }
+
+      logger.success("Git is installed");
+
+      // Step 2: Initialize Git repository if needed
+      if (await needsGitInit(path)) {
+        const initResult = await autoInitializeGit(path, logger);
+        if (!initResult.ok) {
+          logger.error(`Failed to initialize Git: ${initResult.error.message}`);
+          Deno.exit(1);
+        }
+      } else {
+        logger.success("Git repository already initialized");
+      }
+
+      // Step 3: Setup remote repository
+      logger.section("Step 2: Remote Repository Setup");
+
+      if (await needsRemoteSetup(path)) {
+        const remoteResult = await autoCreateRemote(path, logger);
+        if (!remoteResult.ok) {
+          const error = remoteResult.error;
+          const { PublishError } = await import("./utils.ts");
+          if (!(error instanceof PublishError && error.code === "REPO_CREATE_DECLINED")) {
+            logger.error(`Failed to setup remote: ${error.message}`);
+            Deno.exit(1);
+          }
+          logger.info("Skipping remote setup");
+        }
+      } else {
+        logger.success("Remote repository already configured");
+      }
+
+      // Step 4: Check package registries
+      logger.section("Step 3: Package Registry Configuration");
+
+      const { detectRegistries } = await import("./registry.ts");
+      const registries = await detectRegistries(path);
+
+      if (registries.length === 0) {
+        logger.info("No package registries detected");
+        logger.info("Add package.json for npm or deno.json for JSR");
+      } else {
+        registries.forEach((reg) => {
+          logger.success(`Found ${reg.registry}: ${reg.name}@${reg.version}`);
+        });
+
+        // Validate JSR if detected
+        const hasJsr = registries.some((r) => r.registry === "jsr");
+
+        if (hasJsr) {
+          logger.section("Step 4: JSR Configuration");
+
+          const jsrValidationResult = await validateJsrConfig(path);
+
+          if (jsrValidationResult.ok) {
+            const validation = jsrValidationResult.value;
+
+            if (!validation.isValid) {
+              logger.warn("JSR configuration has issues");
+              const fixResult = await autoFixJsrConfig(validation, path, logger);
+
+              if (!fixResult.ok) {
+                logger.warn("JSR configuration not fixed");
+              }
+            } else {
+              logger.success("JSR configuration is valid");
+            }
+          }
+
+          // Check JSR token
+          logger.section("Step 5: JSR Authentication");
+          displayJsrTokenStatus(logger);
+        }
+      }
+
+      // Final summary
+      logger.section("✅ Setup Complete");
+      logger.success("Your project is ready for publishing!");
+      logger.info("\nNext steps:");
+      logger.info("  1. Run 'publishjs check' to verify your setup");
+      logger.info("  2. Run 'publishjs' to publish your project");
+
+      console.log();
+    });
+
   try {
     await command.parse(Deno.args);
   } catch (error) {

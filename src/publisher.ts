@@ -3,26 +3,28 @@
  */
 
 import { verifyAuth } from "./auth.ts";
+import { autoCommitChanges, hasUncommittedChanges } from "./auto_commit.ts";
+import { autoInitializeGit, needsGitInit } from "./auto_init.ts";
+import { autoCreateRemote, needsRemoteSetup } from "./auto_remote.ts";
 import {
   createTag,
   getBranches,
   getGitStatus,
   getTags,
-  initGitRepository,
   isGitInstalled,
   push,
 } from "./git.ts";
 import {
   promptConfirmPublish,
   promptCreateTag,
-  promptInitGit,
   promptPublishType,
   promptSelectBranch,
   promptSelectRegistries,
   promptSelectTag,
 } from "./interactive.ts";
+import { autoFixJsrConfig, validateJsrConfig } from "./jsr_validator.ts";
+import { verifyJsrAuth } from "./jsr_auth.ts";
 import {
-  displayRemoteSetup,
   getPrimaryRemote,
   RemoteInfo,
 } from "./remote.ts";
@@ -69,17 +71,31 @@ export async function publish(
     const gitResult = await verifyGitSetup(path, logger);
     if (!gitResult.ok) return Err(gitResult.error);
 
-    // Phase 2: Verify Remote
+    // Phase 2: Verify Remote (auto-create if needed)
     logger.section("🌐 Checking remote repository");
-    const remoteResult = await getPrimaryRemote(path);
-    if (!remoteResult.ok) {
-      displayRemoteSetup(logger);
-      return Err(remoteResult.error);
+
+    let remote: RemoteInfo;
+
+    if (await needsRemoteSetup(path)) {
+      const autoRemoteResult = await autoCreateRemote(path, logger);
+      if (!autoRemoteResult.ok) {
+        return Err(autoRemoteResult.error);
+      }
+
+      // Get remote info after creation
+      const remoteResult = await getPrimaryRemote(path);
+      if (!remoteResult.ok) {
+        return Err(remoteResult.error);
+      }
+      remote = remoteResult.value;
+    } else {
+      const remoteResult = await getPrimaryRemote(path);
+      if (!remoteResult.ok) {
+        return Err(remoteResult.error);
+      }
+      remote = remoteResult.value;
+      logger.success(`Remote: ${remote.name} (${remote.platform})`);
     }
-    const remote = remoteResult.value;
-    logger.success(
-      `Remote: ${remote.name} (${remote.platform}) - ${remote.url}`,
-    );
 
     // Phase 3: Verify Authentication
     logger.section("🔐 Verifying authentication");
@@ -93,14 +109,27 @@ export async function publish(
     if (!authResult.ok) return Err(authResult.error);
     logger.success("Authentication verified");
 
-    // Phase 4: Determine what to publish
+    // Phase 4: Check for uncommitted changes
+    if (await hasUncommittedChanges(path)) {
+      const commitResult = await autoCommitChanges(path, logger);
+      if (!commitResult.ok) {
+        const error = commitResult.error;
+        if (error instanceof PublishError && error.code === "COMMIT_DECLINED") {
+          logger.warn("Proceeding with uncommitted changes");
+        } else {
+          return Err(error);
+        }
+      }
+    }
+
+    // Phase 5: Determine what to publish
     logger.section("📦 Determining what to publish");
     const refResult = await determineGitRef(options, path, logger);
     if (!refResult.ok) return Err(refResult.error);
     const gitRef = refResult.value;
     logger.success(`Publishing: ${gitRef}`);
 
-    // Phase 5: Detect registries
+    // Phase 6: Detect registries
     logger.section("📚 Detecting package registries");
     const registries = await detectRegistries(path);
     if (registries.length > 0) {
@@ -113,7 +142,7 @@ export async function publish(
       logger.info("No package registries detected (npm/jsr)");
     }
 
-    // Phase 6: Select registries to publish to
+    // Phase 7: Select registries to publish to
     let selectedRegistries: RegistryType[] = [];
     if (!options.skipRegistries && registries.length > 0) {
       const availableRegistries = registries.map((r) =>
@@ -127,7 +156,52 @@ export async function publish(
       );
     }
 
-    // Phase 7: Confirm publish
+    // Phase 8: Validate JSR configuration if publishing to JSR
+    if (selectedRegistries.includes(RegistryType.JSR)) {
+      logger.section("🔍 Validating JSR configuration");
+
+      const jsrValidationResult = await validateJsrConfig(path);
+      if (!jsrValidationResult.ok) {
+        return Err(jsrValidationResult.error);
+      }
+
+      const jsrValidation = jsrValidationResult.value;
+
+      if (!jsrValidation.isValid) {
+        logger.warn("JSR configuration has issues");
+        const fixResult = await autoFixJsrConfig(jsrValidation, path, logger);
+
+        if (!fixResult.ok) {
+          const error = fixResult.error;
+          if (error instanceof PublishError && error.code === "AUTO_FIX_DECLINED") {
+            logger.warn("Publishing to JSR skipped");
+            selectedRegistries = selectedRegistries.filter((r) =>
+              r !== RegistryType.JSR
+            );
+          } else {
+            return Err(error);
+          }
+        } else {
+          logger.success("JSR configuration fixed");
+        }
+      } else {
+        logger.success("JSR configuration is valid");
+      }
+
+      // Verify JSR authentication
+      if (selectedRegistries.includes(RegistryType.JSR)) {
+        const jsrAuthResult = await verifyJsrAuth(logger);
+        if (!jsrAuthResult.ok) {
+          logger.warn("JSR authentication not configured");
+          logger.info("Skipping JSR publishing");
+          selectedRegistries = selectedRegistries.filter((r) =>
+            r !== RegistryType.JSR
+          );
+        }
+      }
+    }
+
+    // Phase 9: Confirm publish
     if (!options.dryRun) {
       const confirmed = await promptConfirmPublish(
         gitRef,
@@ -141,7 +215,7 @@ export async function publish(
       }
     }
 
-    // Phase 8: Execute publish
+    // Phase 10: Execute publish
     if (options.dryRun) {
       logger.info("🏃 Dry run - no changes will be made");
       logger.info(`Would push: ${gitRef} → ${remote.name}`);
@@ -209,28 +283,11 @@ async function verifyGitSetup(
   }
   logger.success("Git is installed");
 
-  // Check if it's a Git repository
-  const statusResult = await getGitStatus(path);
-  if (!statusResult.ok) {
-    return Err(statusResult.error);
-  }
-
-  const status = statusResult.value;
-  if (!status.isRepo) {
-    // Prompt to initialize
-    const shouldInit = await promptInitGit(logger);
-    if (shouldInit) {
-      const initResult = await initGitRepository(path, logger);
-      if (!initResult.ok) {
-        return Err(initResult.error);
-      }
-    } else {
-      return Err(
-        new PublishError(
-          "Not a Git repository and user declined initialization",
-          "NOT_GIT_REPO",
-        ),
-      );
+  // Check if it's a Git repository, auto-initialize if needed
+  if (await needsGitInit(path)) {
+    const initResult = await autoInitializeGit(path, logger);
+    if (!initResult.ok) {
+      return Err(initResult.error);
     }
   } else {
     logger.success("Git repository detected");
