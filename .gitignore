@@ -23,3 +23,7 @@ Thumbs.db
 # Environment variables
 .env
 .env.local
+
+# docs
+*.md
+!README.md
