@@ -1,0 +1,37 @@
+{
+  "name": "puvlish",
+  "version": "0.1.0",
+  "exports": "./src/cli.ts",
+  "tasks": {
+    "dev": "deno run --allow-read --allow-write --allow-run --allow-env src/cli.ts",
+    "test": "deno test --allow-read --allow-write --allow-run --allow-env",
+    "check": "deno check src/**/*.ts",
+    "lint": "deno lint src/",
+    "fmt": "deno fmt src/ tests/",
+    "fmt:check": "deno fmt --check src/ tests/"
+  },
+  "imports": {
+    "@cliffy/command": "jsr:@cliffy/command@^1.0.0-rc.7",
+    "@cliffy/prompt": "jsr:@cliffy/prompt@^1.0.0-rc.7",
+    "@std/assert": "jsr:@std/assert@^1.0.0",
+    "@std/fmt": "jsr:@std/fmt@^1.0.0",
+    "@std/fs": "jsr:@std/fs@^1.0.0",
+    "@std/path": "jsr:@std/path@^1.0.0"
+  },
+  "fmt": {
+    "useTabs": false,
+    "lineWidth": 100,
+    "indentWidth": 2,
+    "semiColons": true,
+    "singleQuote": false,
+    "proseWrap": "preserve"
+  },
+  "lint": {
+    "rules": {
+      "tags": ["recommended"]
+    }
+  },
+  "compilerOptions": {
+    "strict": true
+  }
+}
