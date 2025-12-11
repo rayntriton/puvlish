@@ -1,5 +1,5 @@
 {
-  "name": "@tirio/puvlish",
+  "name": "@tirio/publish",
   "version": "0.1.0",
   "exports": "./src/cli.ts",
   "tasks": {
