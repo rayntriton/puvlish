@@ -28,8 +28,20 @@ function parseGitStatus(output: string): GitChanges {
   const lines = output.split("\n").filter((line) => line.trim().length > 0);
 
   for (const line of lines) {
+    // Git status --porcelain format: XY filename
+    // where X and Y are status codes, followed by a space, then the filename
+    // We need to be more robust in parsing
     const status = line.substring(0, 2);
-    const file = line.substring(3).trim();
+
+    // Find the first non-space character after position 2 to handle variable spacing
+    let fileStartIndex = 2;
+    while (fileStartIndex < line.length && line[fileStartIndex] === ' ') {
+      fileStartIndex++;
+    }
+
+    const file = line.substring(fileStartIndex).trim();
+
+    if (!file) continue; // Skip if no filename found
 
     if (status.includes("M")) {
       changes.modified.push(file);
@@ -55,10 +67,11 @@ function parseGitStatus(output: string): GitChanges {
  */
 async function getUncommittedChanges(
   path: string,
+  logger?: Logger,
 ): Promise<Result<GitChanges>> {
   const result = await executeCommand("git", ["status", "--porcelain"], {
     cwd: path,
-  });
+  }, logger);
 
   if (!result.ok) {
     return Err(
@@ -210,7 +223,7 @@ async function executeCommit(
 ): Promise<Result<void>> {
   // Add all changes
   logger.info("Staging changes...");
-  const addResult = await executeCommand("git", ["add", "."], { cwd: path });
+  const addResult = await executeCommand("git", ["add", "."], { cwd: path }, logger);
 
   if (!addResult.ok) {
     return Err(
@@ -228,6 +241,7 @@ async function executeCommit(
     "git",
     ["commit", "-m", message],
     { cwd: path },
+    logger,
   );
 
   if (!commitResult.ok) {
@@ -264,7 +278,7 @@ export async function autoCommitChanges(
   logger: Logger,
 ): Promise<Result<void>> {
   // Get changes
-  const changesResult = await getUncommittedChanges(path);
+  const changesResult = await getUncommittedChanges(path, logger);
   if (!changesResult.ok) return Err(changesResult.error);
 
   const changes = changesResult.value;

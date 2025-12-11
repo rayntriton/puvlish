@@ -101,6 +101,7 @@ function validateSemver(version: string): boolean {
  */
 export async function validateJsrConfig(
   path: string = Deno.cwd(),
+  logger?: Logger,
 ): Promise<Result<JsrValidation>> {
   const validation: JsrValidation = {
     isValid: false,

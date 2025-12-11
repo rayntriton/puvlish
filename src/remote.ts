@@ -94,8 +94,9 @@ export function getRemoteInfo(remote: GitRemote): RemoteInfo {
  */
 export async function getPrimaryRemote(
   path: string = Deno.cwd(),
+  logger?: Logger,
 ): Promise<Result<RemoteInfo>> {
-  const remotesResult = await getRemotes(path);
+  const remotesResult = await getRemotes(path, logger);
 
   if (!remotesResult.ok) {
     return Err(remotesResult.error);

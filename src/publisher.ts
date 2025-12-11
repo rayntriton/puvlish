@@ -6,6 +6,7 @@ import { verifyAuth } from "./auth.ts";
 import { autoCommitChanges, hasUncommittedChanges } from "./auto_commit.ts";
 import { autoInitializeGit, needsGitInit } from "./auto_init.ts";
 import { autoCreateRemote, needsRemoteSetup } from "./auto_remote.ts";
+import { Confirm } from "@cliffy/prompt";
 import {
   createTag,
   getBranches,
@@ -76,20 +77,20 @@ export async function publish(
 
     let remote: RemoteInfo;
 
-    if (await needsRemoteSetup(path)) {
+    if (await needsRemoteSetup(path, logger)) {
       const autoRemoteResult = await autoCreateRemote(path, logger);
       if (!autoRemoteResult.ok) {
         return Err(autoRemoteResult.error);
       }
 
       // Get remote info after creation
-      const remoteResult = await getPrimaryRemote(path);
+      const remoteResult = await getPrimaryRemote(path, logger);
       if (!remoteResult.ok) {
         return Err(remoteResult.error);
       }
       remote = remoteResult.value;
     } else {
-      const remoteResult = await getPrimaryRemote(path);
+      const remoteResult = await getPrimaryRemote(path, logger);
       if (!remoteResult.ok) {
         return Err(remoteResult.error);
       }
@@ -99,14 +100,79 @@ export async function publish(
 
     // Phase 3: Verify Authentication
     logger.section("🔐 Verifying authentication");
-    const authResult = await verifyAuth(
+    let authResult = await verifyAuth(
       remote.url,
       remote.platform,
       options.remote || "origin",
       path,
       logger,
     );
-    if (!authResult.ok) return Err(authResult.error);
+
+    // If repository not found, offer to create it
+    if (!authResult.ok) {
+      const error = authResult.error;
+      if (error instanceof PublishError && error.code === "REPOSITORY_NOT_FOUND") {
+        logger.info("\n💡 The remote repository doesn't exist yet.");
+
+        try {
+          const shouldCreate = await Confirm.prompt({
+            message: "Would you like to create it now?",
+            default: true,
+          });
+
+          if (shouldCreate) {
+            logger.section("🚀 Creating remote repository");
+
+            // Remove the existing remote first to avoid conflicts
+            const removeResult = await import("./utils.ts").then(m =>
+              m.executeCommand("git", ["remote", "remove", options.remote || "origin"], { cwd: path }, logger)
+            );
+
+            if (!removeResult.ok) {
+              logger.warn("Failed to remove existing remote, continuing anyway...");
+            }
+
+            // Create the remote repository
+            const createResult = await autoCreateRemote(path, logger);
+
+            if (!createResult.ok) {
+              return Err(createResult.error);
+            }
+
+            // Get updated remote info
+            const newRemoteResult = await getPrimaryRemote(path, logger);
+            if (!newRemoteResult.ok) {
+              return Err(newRemoteResult.error);
+            }
+            remote = newRemoteResult.value;
+
+            // Verify authentication again
+            authResult = await verifyAuth(
+              remote.url,
+              remote.platform,
+              options.remote || "origin",
+              path,
+              logger,
+            );
+
+            if (!authResult.ok) {
+              return Err(authResult.error);
+            }
+
+            logger.success("Remote repository created and authenticated!");
+          } else {
+            logger.info("Repository creation cancelled. Please create it manually and try again.");
+            return Err(error);
+          }
+        } catch (promptError) {
+          logger.warn("Prompt cancelled");
+          return Err(error);
+        }
+      } else {
+        return Err(error);
+      }
+    }
+
     logger.success("Authentication verified");
 
     // Phase 4: Check for uncommitted changes
@@ -129,38 +195,80 @@ export async function publish(
     const gitRef = refResult.value;
     logger.success(`Publishing: ${gitRef}`);
 
-    // Phase 6: Detect registries
-    logger.section("📚 Detecting package registries");
-    const registries = await detectRegistries(path);
-    if (registries.length > 0) {
-      registries.forEach((reg) => {
-        logger.info(
-          `Found ${getRegistryName(reg.registry)}: ${reg.name}@${reg.version}`,
-        );
-      });
+    // ============================================
+    // PHASE 6: GIT PUBLISHING (Complete Git workflow)
+    // ============================================
+    logger.section("🚀 Publishing to Git");
+
+    if (options.dryRun) {
+      logger.info("🏃 Dry run - no changes will be made");
+      logger.info(`Would push: ${gitRef} → ${remote.name}`);
     } else {
+      // Push to Git
+      const pushResult = await push(
+        options.remote || "origin",
+        gitRef,
+        { force: options.force },
+        path,
+        logger,
+      );
+      if (!pushResult.ok) {
+        return Err(pushResult.error);
+      }
+    }
+
+    logger.success("✓ Git publishing complete");
+
+    // ============================================
+    // PHASE 7: PACKAGE PUBLISHING (Optional, independent)
+    // ============================================
+    // Only proceed if not skipping registries
+    if (options.skipRegistries) {
+      logger.info("Skipping package registry publishing");
+      logger.section("✅ Publish complete");
+      return Ok(undefined);
+    }
+
+    // Detect registries
+    logger.section("📚 Detecting package registries");
+    const registries = await detectRegistries(path, logger);
+
+    if (registries.length === 0) {
       logger.info("No package registries detected (npm/jsr)");
+      logger.section("✅ Publish complete");
+      return Ok(undefined);
     }
 
-    // Phase 7: Select registries to publish to
-    let selectedRegistries: RegistryType[] = [];
-    if (!options.skipRegistries && registries.length > 0) {
-      const availableRegistries = registries.map((r) =>
-        getRegistryName(r.registry)
+    // Show detected registries
+    registries.forEach((reg) => {
+      logger.info(
+        `Found ${getRegistryName(reg.registry)}: ${reg.name}@${reg.version}`,
       );
-      const selectedResult = await promptSelectRegistries(availableRegistries);
-      if (!selectedResult.ok) return Err(selectedResult.error);
+    });
 
-      selectedRegistries = selectedResult.value.map((name) =>
-        name === "npm" ? RegistryType.NPM : RegistryType.JSR
-      );
+    // Select registries to publish to
+    const availableRegistries = registries.map((r) =>
+      getRegistryName(r.registry)
+    );
+    const selectedResult = await promptSelectRegistries(availableRegistries);
+    if (!selectedResult.ok) return Err(selectedResult.error);
+
+    let selectedRegistries = selectedResult.value.map((name) =>
+      name === "npm" ? RegistryType.NPM : RegistryType.JSR
+    );
+
+    // No registries selected
+    if (selectedRegistries.length === 0) {
+      logger.info("No package registries selected");
+      logger.section("✅ Publish complete");
+      return Ok(undefined);
     }
 
-    // Phase 8: Validate JSR configuration if publishing to JSR
+    // Validate JSR configuration if publishing to JSR
     if (selectedRegistries.includes(RegistryType.JSR)) {
       logger.section("🔍 Validating JSR configuration");
 
-      const jsrValidationResult = await validateJsrConfig(path);
+      const jsrValidationResult = await validateJsrConfig(path, logger);
       if (!jsrValidationResult.ok) {
         return Err(jsrValidationResult.error);
       }
@@ -201,54 +309,48 @@ export async function publish(
       }
     }
 
-    // Phase 9: Confirm publish
+    // No registries left after validation
+    if (selectedRegistries.length === 0) {
+      logger.info("No valid package registries to publish to");
+      logger.section("✅ Publish complete");
+      return Ok(undefined);
+    }
+
+    // Confirm package publishing
+    logger.info("\n📦 Ready to publish to package registries:");
+    selectedRegistries.forEach((r) => {
+      logger.info(`   - ${getRegistryName(r)}`);
+    });
+
     if (!options.dryRun) {
-      const confirmed = await promptConfirmPublish(
-        gitRef,
-        remote.name,
-        selectedRegistries.map(getRegistryName),
-      );
+      const confirmed = await Confirm.prompt({
+        message: "Proceed with package publishing?",
+        default: true,
+      });
 
       if (!confirmed) {
-        logger.warn("Publish cancelled by user");
+        logger.warn("Package publishing cancelled by user");
+        logger.section("✅ Publish complete");
         return Ok(undefined);
       }
     }
 
-    // Phase 10: Execute publish
-    if (options.dryRun) {
-      logger.info("🏃 Dry run - no changes will be made");
-      logger.info(`Would push: ${gitRef} → ${remote.name}`);
-      if (selectedRegistries.length > 0) {
-        logger.info(
-          `Would publish to: ${selectedRegistries.map(getRegistryName).join(", ")}`,
-        );
-      }
-      return Ok(undefined);
-    }
-
-    logger.section("🚀 Publishing");
-
-    // Push to Git
-    const pushResult = await push(
-      options.remote || "origin",
-      gitRef,
-      { force: options.force },
-      path,
-      logger,
-    );
-    if (!pushResult.ok) {
-      return Err(pushResult.error);
-    }
-
     // Publish to registries
-    for (const registry of selectedRegistries) {
-      const publishResult = await publishToRegistry(registry, path, logger);
-      if (!publishResult.ok) {
-        logger.error(
-          `Failed to publish to ${getRegistryName(registry)}: ${publishResult.error.message}`,
-        );
-        // Continue with other registries even if one fails
+    if (options.dryRun) {
+      logger.info(
+        `Would publish to: ${selectedRegistries.map(getRegistryName).join(", ")}`,
+      );
+    } else {
+      logger.section("📦 Publishing to package registries");
+
+      for (const registry of selectedRegistries) {
+        const publishResult = await publishToRegistry(registry, path, logger);
+        if (!publishResult.ok) {
+          logger.error(
+            `Failed to publish to ${getRegistryName(registry)}: ${publishResult.error.message}`,
+          );
+          // Continue with other registries even if one fails
+        }
       }
     }
 
@@ -273,7 +375,7 @@ async function verifyGitSetup(
   logger: Logger,
 ): Promise<Result<void>> {
   // Check if Git is installed
-  const gitInstalled = await isGitInstalled();
+  const gitInstalled = await isGitInstalled(logger);
   if (!gitInstalled) {
     logger.error("Git is not installed or not available in PATH");
     logger.info("Please install Git: https://git-scm.com/downloads");
@@ -284,7 +386,7 @@ async function verifyGitSetup(
   logger.success("Git is installed");
 
   // Check if it's a Git repository, auto-initialize if needed
-  if (await needsGitInit(path)) {
+  if (await needsGitInit(path, logger)) {
     const initResult = await autoInitializeGit(path, logger);
     if (!initResult.ok) {
       return Err(initResult.error);
@@ -337,12 +439,12 @@ async function determineGitRef(
   const type = typeResult.value;
 
   if (type === "branch") {
-    const branchesResult = await getBranches(path);
+    const branchesResult = await getBranches(path, logger);
     if (!branchesResult.ok) {
       return Err(branchesResult.error);
     }
 
-    const statusResult = await getGitStatus(path);
+    const statusResult = await getGitStatus(path, logger);
     const currentBranch = statusResult.ok
       ? statusResult.value.currentBranch
       : null;
@@ -357,7 +459,7 @@ async function determineGitRef(
 
     return Ok(branchResult.value);
   } else if (type === "tag") {
-    const tagsResult = await getTags(path);
+    const tagsResult = await getTags(path, logger);
     if (!tagsResult.ok) {
       return Err(tagsResult.error);
     }

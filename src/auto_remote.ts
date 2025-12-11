@@ -17,16 +17,16 @@ export interface RemoteCreationOptions {
 /**
  * Check if gh CLI is available
  */
-async function isGhCliAvailable(): Promise<boolean> {
-  const result = await executeCommand("gh", ["--version"]);
+async function isGhCliAvailable(logger?: Logger): Promise<boolean> {
+  const result = await executeCommand("gh", ["--version"], undefined, logger);
   return result.ok;
 }
 
 /**
  * Check if glab CLI is available
  */
-async function isGlabCliAvailable(): Promise<boolean> {
-  const result = await executeCommand("glab", ["--version"]);
+async function isGlabCliAvailable(logger?: Logger): Promise<boolean> {
+  const result = await executeCommand("glab", ["--version"], undefined, logger);
   return result.ok;
 }
 
@@ -98,9 +98,38 @@ async function promptRepoCreation(
       }) as RemotePlatform;
     }
 
-    // Get repository name
-    const name = await Input.prompt({
-      message: "Repository name:",
+    // Detect user/org based on platform
+    let detectedUser: string | null = null;
+    if (platform === RemotePlatform.GITHUB) {
+      const userResult = await executeCommand("gh", ["api", "user", "--jq", ".login"], {});
+      if (userResult.ok && userResult.value.trim()) {
+        detectedUser = userResult.value.trim();
+      }
+    } else if (platform === RemotePlatform.GITLAB) {
+      const userResult = await executeCommand("glab", ["api", "user", "--jq", ".username"], {});
+      if (userResult.ok && userResult.value.trim()) {
+        detectedUser = userResult.value.trim();
+      }
+    }
+
+    // Prompt for org/user
+    const orgUser = await Input.prompt({
+      message: "Organization or username:",
+      default: detectedUser || "",
+      validate: (value) => {
+        if (!value || value.trim().length === 0) {
+          return "Organization/username is required";
+        }
+        if (!/^[a-zA-Z0-9_-]+$/.test(value)) {
+          return "Can only contain letters, numbers, hyphens, and underscores";
+        }
+        return true;
+      },
+    });
+
+    // Get package/repository name
+    const packageName = await Input.prompt({
+      message: "Package/Repository name:",
       default: suggestedName,
       validate: (value) => {
         if (!value || value.trim().length === 0) {
@@ -119,8 +148,11 @@ async function promptRepoCreation(
       default: false,
     });
 
+    // Combine org/user with package name for full repository path
+    const fullName = `${orgUser.trim()}/${packageName.trim()}`;
+
     return Ok({
-      name: name.trim(),
+      name: fullName,
       isPrivate,
       platform,
     });
@@ -155,7 +187,7 @@ async function createGitHubRepo(
   ];
 
   // Note: NOT adding --push yet, we'll do that separately
-  const result = await executeCommand("gh", args, { cwd: path });
+  const result = await executeCommand("gh", args, { cwd: path }, logger);
 
   if (!result.ok) {
     return Err(
@@ -172,6 +204,7 @@ async function createGitHubRepo(
     "gh",
     ["repo", "view", "--json", "url", "-q", ".url"],
     { cwd: path },
+    logger,
   );
 
   if (!urlResult.ok) {
@@ -201,7 +234,7 @@ async function createGitLabRepo(
     isPrivate ? "--private" : "--public",
   ];
 
-  const result = await executeCommand("glab", args, { cwd: path });
+  const result = await executeCommand("glab", args, { cwd: path }, logger);
 
   if (!result.ok) {
     return Err(
@@ -220,6 +253,7 @@ async function createGitLabRepo(
     "glab",
     ["repo", "view", "--web", "--no-web"],
     { cwd: path },
+    logger,
   );
 
   if (urlResult.ok) {
@@ -235,11 +269,44 @@ async function createGitLabRepo(
 async function hasRemote(
   remoteName: string = "origin",
   path: string = Deno.cwd(),
+  logger?: Logger,
 ): Promise<boolean> {
-  const remotesResult = await getRemotes(path);
+  const remotesResult = await getRemotes(path, logger);
   if (!remotesResult.ok) return false;
 
   return remotesResult.value.some((r) => r.name === remoteName);
+}
+
+/**
+ * Perform initial push to sync local and remote repositories
+ */
+async function initialPushToRemote(
+  remoteName: string,
+  branch: string,
+  path: string,
+  logger: Logger,
+): Promise<Result<void>> {
+  logger.info(`Pushing ${branch} to ${remoteName}...`);
+
+  const result = await executeCommand(
+    "git",
+    ["push", "-u", remoteName, branch],
+    { cwd: path },
+    logger,
+  );
+
+  if (!result.ok) {
+    return Err(
+      new PublishError(
+        `Failed to push to ${remoteName}`,
+        "GIT_PUSH_FAILED",
+        result.error,
+      ),
+    );
+  }
+
+  logger.success(`Successfully pushed ${branch} to ${remoteName}`);
+  return Ok(undefined);
 }
 
 /**
@@ -250,7 +317,7 @@ export async function autoCreateRemote(
   logger: Logger,
 ): Promise<Result<string>> {
   // Check if remote already exists
-  if (await hasRemote("origin", path)) {
+  if (await hasRemote("origin", path, logger)) {
     logger.debug("Remote 'origin' already exists");
     return Err(
       new PublishError(
@@ -263,8 +330,8 @@ export async function autoCreateRemote(
   logger.section("Remote Repository Setup");
 
   // Check available CLI tools
-  const hasGhCli = await isGhCliAvailable();
-  const hasGlabCli = await isGlabCliAvailable();
+  const hasGhCli = await isGhCliAvailable(logger);
+  const hasGlabCli = await isGlabCliAvailable(logger);
 
   logger.info("Checking available CLI tools...");
   if (hasGhCli) logger.success("GitHub CLI (gh) detected");
@@ -337,17 +404,43 @@ export async function autoCreateRemote(
   }
 
   // Verify remote was added (gh/glab might have done it automatically)
-  if (await hasRemote("origin", path)) {
+  if (await hasRemote("origin", path, logger)) {
     logger.success("Remote 'origin' configured automatically");
-    return Ok(repoUrl);
+  } else {
+    // If not, add it manually
+    logger.info("Configuring remote...");
+    const addResult = await addRemote("origin", repoUrl, path, logger);
+
+    if (!addResult.ok) {
+      return Err(addResult.error);
+    }
   }
 
-  // If not, add it manually
-  logger.info("Configuring remote...");
-  const addResult = await addRemote("origin", repoUrl, path, logger);
+  // Inject authentication token if available (for HTTPS remotes)
+  const { getTokenFromEnv, setRemoteUrlWithToken, detectAuthMethod, AuthMethod } = await import("./auth.ts");
 
-  if (!addResult.ok) {
-    return Err(addResult.error);
+  const authMethod = detectAuthMethod(repoUrl);
+  if (authMethod === AuthMethod.HTTPS) {
+    const token = getTokenFromEnv(options.platform);
+
+    if (token) {
+      logger.info("Configuring authentication with token from environment...");
+      const tokenResult = await setRemoteUrlWithToken("origin", repoUrl, token, path, logger);
+
+      if (!tokenResult.ok) {
+        logger.warn("Failed to configure token, authentication may be required later");
+      }
+    } else {
+      logger.debug("No token found in environment for automatic authentication");
+    }
+  }
+
+  // Perform initial push to sync repositories
+  const pushResult = await initialPushToRemote("origin", "main", path, logger);
+  if (!pushResult.ok) {
+    logger.warn("Failed to push initial commit to remote");
+    logger.info("You can push manually later with: git push -u origin main");
+    // Don't fail the whole process, just warn
   }
 
   logger.success("Remote repository setup complete!");
@@ -359,6 +452,7 @@ export async function autoCreateRemote(
  */
 export async function needsRemoteSetup(
   path: string = Deno.cwd(),
+  logger?: Logger,
 ): Promise<boolean> {
-  return !(await hasRemote("origin", path));
+  return !(await hasRemote("origin", path, logger));
 }

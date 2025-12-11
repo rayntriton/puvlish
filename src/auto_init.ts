@@ -40,6 +40,9 @@ Thumbs.db
 .env.local
 .env.*.local
 
+# npm/registry authentication (SECURITY: never commit tokens)
+.npmrc
+
 # Logs
 *.log
 logs/
@@ -52,7 +55,7 @@ coverage/
 /**
  * Check if directory needs Git initialization
  */
-export async function needsGitInit(path: string = Deno.cwd()): Promise<boolean> {
+export async function needsGitInit(path: string = Deno.cwd(), logger?: Logger): Promise<boolean> {
   return !(await isGitRepository(path));
 }
 
@@ -110,7 +113,7 @@ async function createGitignoreIfNeeded(
 async function initGit(path: string, logger: Logger): Promise<Result<void>> {
   logger.info("Initializing Git repository...");
 
-  const result = await executeCommand("git", ["init"], { cwd: path });
+  const result = await executeCommand("git", ["init"], { cwd: path }, logger);
 
   if (!result.ok) {
     return Err(
@@ -138,7 +141,7 @@ async function createInitialCommit(
   // Check if there are any files to commit
   const statusResult = await executeCommand("git", ["status", "--porcelain"], {
     cwd: path,
-  });
+  }, logger);
 
   if (!statusResult.ok) {
     return Err(
@@ -179,7 +182,7 @@ async function createInitialCommit(
   }
 
   // Add all files
-  const addResult = await executeCommand("git", ["add", "."], { cwd: path });
+  const addResult = await executeCommand("git", ["add", "."], { cwd: path }, logger);
 
   if (!addResult.ok) {
     return Err(
@@ -196,6 +199,7 @@ async function createInitialCommit(
     "git",
     ["commit", "-m", commitMessage],
     { cwd: path },
+    logger,
   );
 
   if (!commitResult.ok) {
@@ -213,6 +217,33 @@ async function createInitialCommit(
 }
 
 /**
+ * Rename current branch to 'main'
+ */
+async function renameBranchToMain(
+  path: string,
+  logger: Logger,
+): Promise<Result<void>> {
+  logger.info("Renaming branch to 'main'...");
+
+  const result = await executeCommand("git", ["branch", "-M", "main"], {
+    cwd: path,
+  }, logger);
+
+  if (!result.ok) {
+    return Err(
+      new PublishError(
+        "Failed to rename branch to 'main'",
+        "GIT_BRANCH_RENAME_FAILED",
+        result.error,
+      ),
+    );
+  }
+
+  logger.success("Branch renamed to 'main'");
+  return Ok(undefined);
+}
+
+/**
  * Configure Git user if not already configured
  */
 async function ensureGitUser(path: string, logger: Logger): Promise<Result<void>> {
@@ -221,12 +252,14 @@ async function ensureGitUser(path: string, logger: Logger): Promise<Result<void>
     "git",
     ["config", "user.name"],
     { cwd: path },
+    logger,
   );
 
   const emailResult = await executeCommand(
     "git",
     ["config", "user.email"],
     { cwd: path },
+    logger,
   );
 
   const hasName = nameResult.ok && nameResult.value.length > 0;
@@ -254,6 +287,7 @@ async function ensureGitUser(path: string, logger: Logger): Promise<Result<void>
         "git",
         ["config", "user.name", name],
         { cwd: path },
+        logger,
       );
 
       if (!setNameResult.ok) {
@@ -279,6 +313,7 @@ async function ensureGitUser(path: string, logger: Logger): Promise<Result<void>
         "git",
         ["config", "user.email", email],
         { cwd: path },
+        logger,
       );
 
       if (!setEmailResult.ok) {
@@ -348,6 +383,12 @@ export async function autoInitializeGit(
   const commitResult = await createInitialCommit(path, logger);
   if (!commitResult.ok) {
     logger.warn("Failed to create initial commit, continuing anyway...");
+  }
+
+  // Rename branch to 'main'
+  const renameResult = await renameBranchToMain(path, logger);
+  if (!renameResult.ok) {
+    logger.warn("Failed to rename branch to 'main', continuing anyway...");
   }
 
   logger.success("Git repository setup complete!");

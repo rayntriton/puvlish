@@ -21,8 +21,8 @@ export interface GitRemote {
 /**
  * Check if Git is installed on the system
  */
-export async function isGitInstalled(): Promise<boolean> {
-  const result = await executeCommand("git", ["--version"]);
+export async function isGitInstalled(logger?: Logger): Promise<boolean> {
+  const result = await executeCommand("git", ["--version"], undefined, logger);
   return result.ok;
 }
 
@@ -43,7 +43,7 @@ export async function initGitRepository(
 ): Promise<Result<void>> {
   logger?.info("Initializing Git repository...");
 
-  const result = await executeCommand("git", ["init"], { cwd: path });
+  const result = await executeCommand("git", ["init"], { cwd: path }, logger);
 
   if (!result.ok) {
     return Err(
@@ -64,6 +64,7 @@ export async function initGitRepository(
  */
 export async function getGitStatus(
   path: string = Deno.cwd(),
+  logger?: Logger,
 ): Promise<Result<GitStatus>> {
   const isRepo = await isGitRepository(path);
 
@@ -79,17 +80,17 @@ export async function getGitStatus(
   // Get current branch
   const branchResult = await executeCommand("git", ["branch", "--show-current"], {
     cwd: path,
-  });
+  }, logger);
   const currentBranch = branchResult.ok ? branchResult.value : null;
 
   // Check if there's a remote
-  const remoteResult = await executeCommand("git", ["remote"], { cwd: path });
+  const remoteResult = await executeCommand("git", ["remote"], { cwd: path }, logger);
   const hasRemote = remoteResult.ok && remoteResult.value.length > 0;
 
   // Check if working directory is dirty
   const statusResult = await executeCommand("git", ["status", "--porcelain"], {
     cwd: path,
-  });
+  }, logger);
   const isDirty = statusResult.ok && statusResult.value.length > 0;
 
   return Ok({
@@ -105,10 +106,11 @@ export async function getGitStatus(
  */
 export async function getBranches(
   path: string = Deno.cwd(),
+  logger?: Logger,
 ): Promise<Result<string[]>> {
   const result = await executeCommand("git", ["branch", "--format=%(refname:short)"], {
     cwd: path,
-  });
+  }, logger);
 
   if (!result.ok) {
     return Err(
@@ -127,8 +129,8 @@ export async function getBranches(
 /**
  * Get all tags
  */
-export async function getTags(path: string = Deno.cwd()): Promise<Result<string[]>> {
-  const result = await executeCommand("git", ["tag", "--list"], { cwd: path });
+export async function getTags(path: string = Deno.cwd(), logger?: Logger): Promise<Result<string[]>> {
+  const result = await executeCommand("git", ["tag", "--list"], { cwd: path }, logger);
 
   if (!result.ok) {
     return Err(
@@ -149,8 +151,9 @@ export async function getTags(path: string = Deno.cwd()): Promise<Result<string[
  */
 export async function getRemotes(
   path: string = Deno.cwd(),
+  logger?: Logger,
 ): Promise<Result<GitRemote[]>> {
-  const result = await executeCommand("git", ["remote", "-v"], { cwd: path });
+  const result = await executeCommand("git", ["remote", "-v"], { cwd: path }, logger);
 
   if (!result.ok) {
     return Err(
@@ -196,7 +199,7 @@ export async function push(
 
   logger?.info(`Pushing ${ref} to ${remote}...`);
 
-  const result = await executeCommand("git", args, { cwd: path });
+  const result = await executeCommand("git", args, { cwd: path }, logger);
 
   if (!result.ok) {
     return Err(
@@ -231,7 +234,7 @@ export async function createTag(
 
   logger?.info(`Creating tag ${tagName}...`);
 
-  const result = await executeCommand("git", args, { cwd: path });
+  const result = await executeCommand("git", args, { cwd: path }, logger);
 
   if (!result.ok) {
     return Err(
@@ -260,7 +263,7 @@ export async function addRemote(
 
   const result = await executeCommand("git", ["remote", "add", name, url], {
     cwd: path,
-  });
+  }, logger);
 
   if (!result.ok) {
     return Err(
@@ -277,12 +280,40 @@ export async function addRemote(
 }
 
 /**
+ * Test if we can access a remote (read permissions)
+ */
+export async function canAccessRemote(
+  remote: string = "origin",
+  path: string = Deno.cwd(),
+  logger?: Logger,
+): Promise<Result<boolean>> {
+  // Use ls-remote to check if we can access the remote
+  // This works even for empty repositories
+  const result = await executeCommand("git", ["ls-remote", "--heads", remote], {
+    cwd: path,
+  }, logger);
+
+  if (!result.ok) {
+    return Err(
+      new PublishError(
+        `Failed to access remote: ${result.error.message}`,
+        "REMOTE_ACCESS_FAILED",
+        result.error,
+      ),
+    );
+  }
+
+  return Ok(true);
+}
+
+/**
  * Test if we can push to a remote (dry run)
  */
 export async function canPush(
   remote: string = "origin",
   branch?: string,
   path: string = Deno.cwd(),
+  logger?: Logger,
 ): Promise<boolean> {
   const args = ["push", "--dry-run", remote];
 
@@ -290,6 +321,6 @@ export async function canPush(
     args.push(branch);
   }
 
-  const result = await executeCommand("git", args, { cwd: path });
+  const result = await executeCommand("git", args, { cwd: path }, logger);
   return result.ok;
 }

@@ -2,7 +2,7 @@
  * Authentication module for publishjs
  */
 
-import { canPush } from "./git.ts";
+import { canPush, canAccessRemote } from "./git.ts";
 import { RemotePlatform } from "./remote.ts";
 import { Err, Logger, Ok, PublishError, Result } from "./utils.ts";
 
@@ -25,15 +25,35 @@ export function detectAuthMethod(remoteUrl: string): AuthMethod {
 }
 
 /**
+ * Check if user has access to remote (for authentication verification)
+ */
+export async function checkRemoteAccess(
+  remote: string = "origin",
+  path: string = Deno.cwd(),
+  logger?: Logger,
+): Promise<Result<boolean>> {
+  // Use ls-remote instead of push --dry-run for better compatibility
+  // with new/empty repositories
+  const canAccessResult = await canAccessRemote(remote, path, logger);
+
+  if (!canAccessResult.ok) {
+    return Err(canAccessResult.error);
+  }
+
+  return Ok(canAccessResult.value);
+}
+
+/**
  * Check if user has push permissions to remote
  */
 export async function checkPushPermissions(
   remote: string = "origin",
   branch?: string,
   path: string = Deno.cwd(),
+  logger?: Logger,
 ): Promise<Result<boolean>> {
   try {
-    const canPushResult = await canPush(remote, branch, path);
+    const canPushResult = await canPush(remote, branch, path, logger);
     return Ok(canPushResult);
   } catch (error) {
     return Err(
@@ -183,8 +203,66 @@ export function getTokenFromEnv(platform: RemotePlatform): string | undefined {
 }
 
 /**
+ * Inject token into HTTPS URL
+ */
+export function injectTokenIntoUrl(url: string, token: string): string {
+  // Remove any existing credentials from URL
+  let cleanUrl = url.replace(/https:\/\/[^@]+@/, "https://");
+
+  // Inject token into URL
+  return cleanUrl.replace("https://", `https://${token}@`);
+}
+
+/**
+ * Set remote URL with token injected
+ */
+export async function setRemoteUrlWithToken(
+  remoteName: string,
+  url: string,
+  token: string,
+  path: string = Deno.cwd(),
+  logger?: Logger,
+): Promise<Result<void>> {
+  const { executeCommand } = await import("./utils.ts");
+
+  const newUrl = injectTokenIntoUrl(url, token);
+
+  logger?.debug(`Injecting authentication token into remote URL...`);
+
+  const result = await executeCommand(
+    "git",
+    ["remote", "set-url", remoteName, newUrl],
+    { cwd: path },
+    logger,
+  );
+
+  if (!result.ok) {
+    return Err(
+      new PublishError(
+        "Failed to update remote URL with token",
+        "REMOTE_URL_UPDATE_FAILED",
+        result.error,
+      ),
+    );
+  }
+
+  logger?.success("Remote URL updated with authentication token");
+  return Ok(undefined);
+}
+
+/**
  * Verify authentication for publishing
  */
+/**
+ * Check if error indicates repository doesn't exist
+ */
+function isRepositoryNotFoundError(error: Error): boolean {
+  const message = error.message.toLowerCase();
+  return message.includes("repository not found") ||
+    message.includes("could not find repository") ||
+    message.includes("not found");
+}
+
 export async function verifyAuth(
   remoteUrl: string,
   platform: RemotePlatform,
@@ -192,20 +270,92 @@ export async function verifyAuth(
   path: string = Deno.cwd(),
   logger?: Logger,
 ): Promise<Result<void>> {
-  logger?.debug("Checking push permissions...");
+  logger?.debug("Checking remote access...");
 
   const authMethod = detectAuthMethod(remoteUrl);
-  const canPushResult = await checkPushPermissions(remote, undefined, path);
+  const accessResult = await checkRemoteAccess(remote, path, logger);
 
-  if (!canPushResult.ok) {
-    return Err(canPushResult.error);
+  if (!accessResult.ok) {
+    // Check if it's a "repository not found" error
+    if (isRepositoryNotFoundError(accessResult.error)) {
+      logger?.warn("Remote repository does not exist yet");
+      logger?.info("The repository needs to be created on the remote platform");
+      logger?.info("\nOptions:");
+      logger?.info("  1. Run 'publishjs init' to create the repository automatically");
+      logger?.info("  2. Create it manually and run this command again");
+
+      return Err(
+        new PublishError(
+          "Remote repository not found. Create it with 'publishjs init' or manually.",
+          "REPOSITORY_NOT_FOUND",
+        ),
+      );
+    }
+    return Err(accessResult.error);
   }
 
-  if (!canPushResult.value) {
+  if (!accessResult.value) {
+    // If HTTPS auth failed, try to inject token from environment
+    if (authMethod === AuthMethod.HTTPS) {
+      const token = getTokenFromEnv(platform);
+
+      if (token) {
+        logger?.info("Found authentication token in environment, configuring remote...");
+
+        const setUrlResult = await setRemoteUrlWithToken(
+          remote,
+          remoteUrl,
+          token,
+          path,
+          logger,
+        );
+
+        if (setUrlResult.ok) {
+          // Re-check access after injecting token
+          const recheckResult = await checkRemoteAccess(remote, path, logger);
+
+          if (recheckResult.ok && recheckResult.value) {
+            logger?.success("Authentication configured successfully");
+            return Ok(undefined);
+          }
+
+          // If recheck failed, check if it's a repository not found error
+          if (!recheckResult.ok && isRepositoryNotFoundError(recheckResult.error)) {
+            // Repository not found even with token
+            logger?.warn("Remote repository does not exist yet");
+            logger?.info("The repository needs to be created on the remote platform");
+            logger?.info("\nOptions:");
+            logger?.info("  1. Run 'publishjs init' to create the repository automatically");
+            logger?.info("  2. Create it manually and run this command again");
+
+            return Err(
+              new PublishError(
+                "Remote repository not found. Create it with 'publishjs init' or manually.",
+                "REPOSITORY_NOT_FOUND",
+              ),
+            );
+          }
+
+          // If authentication still failed for other reasons
+          logger?.warn("Token found but authentication still failed");
+          return Err(
+            new PublishError(
+              "Authentication failed after token injection. Check token permissions.",
+              "AUTH_FAILED",
+            ),
+          );
+        }
+
+        logger?.warn("Failed to set remote URL with token");
+      } else {
+        logger?.warn("No token found in environment");
+      }
+    }
+
     displayAuthSetup(logger || new Logger(), authMethod, platform);
     return Err(
       new PublishError(
-        "Push permissions check failed. Please set up authentication.",
+        "Remote access check failed. Please set up authentication.",
         "AUTH_FAILED",
       ),
     );

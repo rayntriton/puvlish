@@ -145,11 +145,11 @@ async function main() {
 
       // Check Git
       logger.section("Git");
-      const gitInstalled = await isGitInstalled();
+      const gitInstalled = await isGitInstalled(logger);
       if (gitInstalled) {
         logger.success("Git is installed");
 
-        const statusResult = await getGitStatus();
+        const statusResult = await getGitStatus(Deno.cwd(), logger);
         if (statusResult.ok) {
           const status = statusResult.value;
           if (status.isRepo) {
@@ -170,7 +170,7 @@ async function main() {
 
       // Check Remote
       logger.section("Remote Repository");
-      const remoteResult = await getPrimaryRemote();
+      const remoteResult = await getPrimaryRemote(Deno.cwd(), logger);
       if (remoteResult.ok) {
         const remote = remoteResult.value;
         logger.success(`Remote: ${remote.name}`);
@@ -200,7 +200,7 @@ async function main() {
 
       // Check Registries
       logger.section("Package Registries");
-      const registries = await detectRegistries();
+      const registries = await detectRegistries(Deno.cwd(), logger);
       if (registries.length > 0) {
         registries.forEach((reg) => {
           logger.success(`${reg.registry}: ${reg.name}@${reg.version}`);
@@ -233,7 +233,7 @@ async function main() {
 
       // Step 1: Check Git installation
       logger.section("Step 1: Git Setup");
-      const gitInstalled = await isGitInstalled();
+      const gitInstalled = await isGitInstalled(logger);
 
       if (!gitInstalled) {
         logger.error("Git is not installed");
@@ -245,7 +245,7 @@ async function main() {
       logger.success("Git is installed");
 
       // Step 2: Initialize Git repository if needed
-      if (await needsGitInit(path)) {
+      if (await needsGitInit(path, logger)) {
         const initResult = await autoInitializeGit(path, logger);
         if (!initResult.ok) {
           logger.error(`Failed to initialize Git: ${initResult.error.message}`);
@@ -258,7 +258,7 @@ async function main() {
       // Step 3: Setup remote repository
       logger.section("Step 2: Remote Repository Setup");
 
-      if (await needsRemoteSetup(path)) {
+      if (await needsRemoteSetup(path, logger)) {
         const remoteResult = await autoCreateRemote(path, logger);
         if (!remoteResult.ok) {
           const error = remoteResult.error;
@@ -277,7 +277,7 @@ async function main() {
       logger.section("Step 3: Package Registry Configuration");
 
       const { detectRegistries } = await import("./registry.ts");
-      const registries = await detectRegistries(path);
+      const registries = await detectRegistries(path, logger);
 
       if (registries.length === 0) {
         logger.info("No package registries detected");
@@ -293,7 +293,7 @@ async function main() {
         if (hasJsr) {
           logger.section("Step 4: JSR Configuration");
 
-          const jsrValidationResult = await validateJsrConfig(path);
+          const jsrValidationResult = await validateJsrConfig(path, logger);
 
           if (jsrValidationResult.ok) {
             const validation = jsrValidationResult.value;
@@ -324,6 +324,38 @@ async function main() {
       logger.info("  2. Run 'publishjs' to publish your project");
 
       console.log();
+    });
+
+  // Add package command for configuring npm/JSR
+  command
+    .command("package")
+    .description("Configure package for npm and/or JSR publishing")
+    .option("-v, --verbose", "Enable verbose logging", { default: false })
+    .option("--dry-run", "Show what would be created without making changes", { default: false })
+    .option(
+      "--registry <registry...>",
+      "Specify registries to configure (npm, jsr)",
+      { collect: true },
+    )
+    .action(async (options) => {
+      const { runPackageWizard } = await import("./package_wizard.ts");
+
+      const result = await runPackageWizard(
+        {
+          registry: options.registry as string[] | undefined,
+          verbose: options.verbose,
+          dryRun: options.dryRun,
+        },
+        Deno.cwd(),
+      );
+
+      if (!result.ok) {
+        console.error(`\n❌ Package configuration failed: ${result.error.message}`);
+        if (options.verbose && result.error.cause) {
+          console.error(`\nDetails: ${result.error.cause}`);
+        }
+        Deno.exit(1);
+      }
     });
 
   try {
